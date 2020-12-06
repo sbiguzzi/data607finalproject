@@ -1,0 +1,934 @@
+---
+title: "DATA 607: Final Project - Predicting Serie A Matchday 10"
+author: "Stefano Biguzzi"
+date: "12/5/2020"
+output:
+  html_document:
+    highlight: pygments
+    theme: cerulean
+    toc: true
+    toc_float: true
+    code_folding: hide
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = F, warning = F, 
+                      opts.label="kill_prefix" )
+```
+```{r, echo = F}
+set.seed(78553523)
+```
+
+# Loading Libraries
+```{r}
+library(tidyverse)
+library(rvest)
+library(prob)
+library(stargazer)
+library(GGally)
+library(nnet)
+library(knitr)
+library(kableExtra)
+```
+
+# Introduction
+Inspired by my love for soccer and [FiveThirtyEight's soccer prediction page](https://projects.fivethirtyeight.com/soccer-predictions/serie-a/), I set out to find a way to predict outcomes of Serie A games. My idea is to gather more data than the basic information you can find per matches on a site like ESPN. I start by loading in the FiveThirtyEight data from their GitHub. Rather than just use the FiveThirtyEight data, I wanted to add some more in game data.
+
+I found a website, [fbref](https://fbref.com/en/), that had different tables for in game data. These included shooting, passing, pass type, goal and shot creation, defensive actions, possession, and miscellaneous stats. This seemed like a great place to start, but it quickly became obvious that I needed to write some scrapping code to be able to collect all these data per team per season.
+
+To gather all the website I wrote a for loop that allowed me to call each website (each table per team per season) and get the data I needed. I stored it into a list then converted it to a data frame. Using this approach highlighted in the ***FBref Data Section***, I was able to get the data I needed to add a little more depth to my analysis.
+
+My next step was to understand what variables to use in my predictive model. I knew I wanted to use goal creating actions, goals per shot, and the FiveThirtyEight metric spi ([soccer power index](https://fivethirtyeight.com/methodology/how-our-club-soccer-predictions-work/)), since the more goals scored the likelier a team is to win. I also wanted to add more variables that might per correlated to goals but not easily understood to be related to goals.
+
+To create the list of variables I looked through a huge correlation matrix of all 127 variables and decided to use variables that were correlated to goals for either at +0.5 and above or -0.4 and below level. Next I created a logistic regression using all the variables I thought were correlated enough and applied the backward selection process to finalize a model that had a high Adj-$R^{2}$ and was significant.
+
+The last step is to develop a multinomial logistic regression to predict winners for match day 10, starting on Dec 5th and the last game being played on Dec 11th.
+
+# Loading data
+
+## FiveThirtyEight Data^[https://github.com/fivethirtyeight/data/tree/master/soccer-spi]
+
+We can call the data directly from FiveThirtyEight's GitHub. It loads in around 43 thousand rows of data from multiple soccer leagues around the world.
+```{r, message=F}
+spi_url <- "https://projects.fivethirtyeight.com/soccer-api/club/spi_matches.csv"
+spi.df <- read.csv(url(spi_url))
+```
+
+We filter the data frame to just Serie A league matches from the 2017/18 season to the 2020/21 season. We also rename the team1 and team2 columns to home and away for clarity.
+```{r}
+#subset data
+spi.df <-
+  subset(spi.df, spi.df$league == "Italy Serie A" &
+           spi.df$season %in% c("2017","2018","2019","2020"))
+
+#rename columns
+spi.df <- rename(spi.df, c("Home"="team1","Away"="team2"))
+```
+
+Because fbref and FiveThirtyEight have a different data structure it was important to split up the data points for the home team, represented by the columns ending in 1, and data points for the away team, represented by the columns ending in 2.
+```{r}
+#create the home data frame
+home.df <- spi.df[,c("date", "league", "season", "Home", "spi1", "prob1",
+                     "probtie", "proj_score1", "importance1", "score1", "xg1", 
+                     "nsxg1", "adj_score1")]
+
+#rename home df columns
+colnames(home.df) <- c("date", "league", "season", 'team', 'spi', 'probwin',
+                       'probtie', 'proj_score', 'importance', 'score', 'xg', 
+                       'nsxg', 'adj_score')
+
+#create the venue column
+home.df$venue <- "Home"
+
+#create the away data frame
+away.df <- spi.df[,c("date", "league", "season", "Away", "spi2", "prob2", 
+                     "probtie", "proj_score2", "importance2", "score2", "xg2", 
+                     "nsxg2", "adj_score2")]
+
+#rename away df columns
+colnames(away.df) <- c("date", "league", "season", 'team','spi', 'probwin',
+                       'probtie', 'proj_score', 'importance','score',
+                       'xg', 'nsxg', 'adj_score')
+
+#create venue column
+away.df$venue <- "Away"
+
+#bind home and away data frames
+spi.df <- rbind(home.df,away.df)
+```
+
+Additionally, fbref and FiveThirtyEight differ in the naming convention for some of the teams so it was important to standardize them.
+```{r}
+#renaming some teams to standardize with fbref
+spi.df$team <- gsub("Chievo Verona","Chievo",spi.df$team)
+spi.df$team <- gsub("Spal","SPAL",spi.df$team)
+spi.df$team <- gsub("AS Roma","Roma",spi.df$team)
+spi.df$team <- gsub("AC Milan","Milan",spi.df$team)
+```
+
+Finally, because each team only plays one game per week I created a unique id using the date the game was played and the name of the team.
+```{r}
+#create merge id
+spi.df$id <- paste(spi.df$date,spi.df$team,sep = "_")
+```
+```{r,echo=F}
+rm(away.df, home.df, spi_url)
+```
+
+## FBref Data^[https://fbref.com/en/comps/11/history/Serie-A-Seasons]
+Loading in the fbref data was a challenge, but by using loops and web scrapping techniques, I was able to grab all the data I could from the website.
+
+### Create URL List
+Because each table lived on its own url, I had to create a url list using all the required information. The only three pieces of information I needed were the season names and season id,
+```{r}
+#create season data
+season_dict <- 
+  as.data.frame(cbind(c('2017-2018','2018-2019','2019-2020','2020-2021'),
+                      c('s1640','s1896','s3260','s10730')))
+
+#name columns
+colnames(season_dict) <- c("season","seasonid")
+```
+the type of data I wanted from the website,
+```{r}
+#create data type data
+data_dict <- as.data.frame(c('passing','passing_types','gca','defense',
+                             'possession','misc','shooting'))
+
+#rename columns
+colnames(data_dict) <- c("datatype")
+```
+and the team names and team ids
+```{r}
+#create team data
+team_dict <- as.data.frame(cbind(c("Juventus", "Napoli", "Atalanta", "Inter",
+                                   "Milan", "Roma", "Torino", "Lazio", 
+                                   "Sampdoria", "Bologna", "Sassuolo", "Udinese",
+                                   "SPAL", "Parma", "Cagliari", "Fiorentina", 
+                                   "Genoa", "Empoli", "Frosinone", "Chievo", 
+                                   "Hellas-Verona", "Lecce", "Brescia", "Spezia",
+                                   "Benevento", "Crotone"),
+                                 c("e0652b02", "d48ad4ff", "922493f3", 
+                                   "d609edc0", "dc56fe14", "cf74a709",
+                                   "105360fe", "7213da33", "8ff9e3b3", 
+                                   "1d8099f8", "e2befd26", "04eea015",
+                                   "1d2fe027", "eab4234c", "c4260e09", 
+                                   "421387cf", "658bf2de", "a3d88bd8",
+                                   "6a7ad59d", "cc919b35", "0e72edf2", 
+                                   "ffcbe334", "4ef57aeb", "68449f6d",
+                                   "4fcb34fd", "3074d7b1")))
+#rename columns
+colnames(team_dict) <- c("team","teamid")
+```
+I merged them all together to create the data frame.
+```{r}
+#initiate loop.df by merging season and team data
+loop.df <- merge(season_dict,team_dict,all=T)
+
+#merge on data type data
+loop.df <- merge(loop.df, data_dict, all=T)
+```
+
+Once I created the loop data frame, I used a for loop to create all the urls I needed to hit to get the data I wanted. Each url would then be pasted to a url_list to be used in scrapping data.
+```{r}
+#initiate list
+url_list <- list()
+for(i in 1:nrow(loop.df)){
+  season <- loop.df[i,c("season")] #set the season
+  seasonid <- loop.df[i,c("seasonid")] #set the season id
+  team <- loop.df[i,c("team")] #set team name
+  teamid <- loop.df[i,c("teamid")] #set team id
+  datatype <- loop.df[i,c("datatype")] #set data type
+  url <- sprintf("https://fbref.com/en/squads/%s/%s/matchlogs/%s/%s/",
+                 teamid,season,seasonid,datatype) #construct url
+  url_list <- append(url_list,url) #append url to url list
+}
+```
+```{r,echo=F}
+rm(season_dict, data_dict, team_dict, loop.df, i, season, seasonid, team,
+   teamid, datatype)
+```
+
+### Pull FBref Data
+Once we get all the urls we can run each url for the same data points, for example the defense data points, in a for loop and read each html table into a list called defense. We do this for the seven data points. I will show the code for the defense data point.^[All the code is the same except the grepl pattern changes from defense to one of the other six data points]
+```{r}
+defense <- list()
+for(url in url_list){
+  if(grepl("/defense/",url)){ #select only urls with defense in them
+    tmp.defense <- read_html(url) %>% #read the url
+      html_nodes("table") %>% #find the table on the page
+      html_table() #grab the data from the table
+    defense <- append(defense,tmp.defense) #append the data frame as a list
+  }
+}
+```
+
+```{r, echo=F}
+#goal shooting and shot creating actions
+gca <- list()
+for(url in url_list){
+  if(grepl("/gca/",url)){
+    tmp.gca <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    gca <- append(gca,tmp.gca)
+  }
+}
+#miscellaneous data
+misc <- list()
+for(url in url_list){
+  if(grepl("/misc/",url)){
+    tmp.misc <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    misc <- append(misc,tmp.misc)
+  }
+}
+#passing data
+passing <- list()
+for(url in url_list){
+  if(grepl("/passing/",url)){
+    tmp.passing <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    passing <- append(passing,tmp.passing)
+  }
+}
+#data on pass types
+passing_types <- list()
+for(url in url_list){
+  if(grepl("/passing_types/",url)){
+    tmp.passing_types <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    passing_types <- append(passing_types,tmp.passing_types)
+  }
+}
+#data on possession
+possession <- list()
+for(url in url_list){
+  if(grepl("/possession/",url)){
+    tmp.possession <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    possession <- append(possession,tmp.possession)
+  }
+}
+#shooting data
+shooting <- list()
+for(url in url_list){
+  if(grepl("/shooting/",url)){
+    tmp.shooting <-
+      read_html(url) %>%
+      html_nodes("table") %>%
+      html_table()
+    shooting <- append(shooting,tmp.shooting)
+  }
+}
+```
+Each of the data points becomes a lists of 60 data frames that need to be manipulated to become one.
+```{r,echo=F}
+rm(url, url_list, tmp.defense, tmp.gca, tmp.misc, tmp.passing, tmp.passing_types,
+   tmp.possession, tmp.shooting)
+```
+
+### Cleaning fbref data
+Once we scrapped all the data we wanted, we have to transform it from a list to a data frame to analyze the data. We also add the team names to the data, since the scrapped table doesn't include the team names in the rows, but in the column.
+
+We use regex to grab the team name from the column, since it's the last word in the first column: `r colnames(defense[[1]])[1]`. I then have to set the column name in the first row of the data because that's how it was pulled from the website.
+
+```{r}
+#loop through each data frame in the list and create team column
+defense <- lapply(defense, function(x) {
+  cbind(x, Team = ifelse(x[,32]=="Err", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+```
+Once the *team* column is in the data, we can now replace the old column names with the first row of the data.
+```{r}
+#loop through each data frame in the list to assign column names from row 1
+defense <- lapply(defense, function(x) tail("names<-"(x, x[1, ]), -1))
+```
+
+Once that was done, I noticed that the tables on the website had some hidden values that showed up when reading the html in R. Luckily these rows were every other number. That made it easy to deleted each row.
+```{r}
+#set sequence of row numbers to delete
+def.todel <- seq(0, nrow(defense[[1]]), 2)
+
+#delete the 'hidden' rows
+defense <- lapply(defense, function(x) {x <- x[-def.todel, ]})
+```
+
+Finally we create the data frame for each data point, and remove the rows that are the "Totals", that is the sum of all the columns.
+```{r}
+#rbind all the data frames together
+defense.df <- do.call(rbind, defense)
+
+#delete the total row
+defense.df <- defense.df[which(defense.df$Date!=""),]
+```
+
+I renamed the columns for easier understanding, created the same ID varibale as the FiveThirtyEight data to be able to join them together, and reset the row count.
+```{r}
+#rename columns
+colnames(defense.df) <- c("date", "time", "round", "day", "venue", "result", 
+                          "goalsF", "goalsA", "opp", "plyrsTkl", "TklW", 
+                          "def3Tkl", "mid3Tkl", "att3Tkl", "drblsTkl", 
+                          "drblsCon", "pctDrblsTkl", "oppDrblsPast", "pressure",
+                          "success", "pctPressure", "def3Press", "mid3Press",
+                          "att3Press", "blocks", "blockSh", "blockOtSh",
+                          "blockPass", "interceptions", "tkl+int", "clears", 
+                          "errors", "matchreport", "team")
+
+#create id to merge with spi data
+defense.df$id <- paste(defense.df$date,defense.df$team,sep = "_")
+
+#reset rownames
+rownames(defense.df) <- NULL
+```
+I did this same process for all the other 6 fbref variables.
+
+```{r, echo=F}
+#goal and shot actions
+gca <- lapply(gca, function(x) {
+  cbind(x, Team = ifelse(x[,24]=="OG", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+gca <- lapply(gca, function(x) tail("names<-"(x, x[1, ]), -1))
+
+gca.todel <- seq(0, nrow(gca[[1]]), 2)
+gca <- lapply(gca, function(x) {x <- x[-gca.todel, ]})
+
+gca.df <- do.call(rbind, gca)
+gca.df <- gca.df[which(gca.df$Date!=""),]
+
+colnames(gca.df) <- c("date", "time", "round", "day", "venue", "result",
+                      "goalsF", "goalsA", "opp", "shAction", "livePtoSh", 
+                      "deadPtoSh", "drblToSh", "shToSh", "flsToSh", "defToSh",
+                      "glAction", "livePtoGl", "deadPtoGl", "drblToGl", 
+                      "shotToGl", "foulToGl", "defToGl", "actionToOg", 
+                      "matchreport", "team")
+
+gca.df$id <- paste(gca.df$date,gca.df$team,sep = "_")
+
+rownames(gca.df) <- NULL
+
+#miscellaneous data
+misc <- lapply(misc, function(x) {
+  cbind(x, Team = ifelse(x[,25]=="Won%", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+misc <- lapply(misc, function(x) tail("names<-"(x, x[1, ]), -1))
+
+misc.todel <- seq(0, nrow(misc[[1]]), 2)
+misc <- lapply(misc, function(x) {x <- x[-misc.todel, ]})
+
+misc.df <- do.call(rbind, misc)
+misc.df <- misc.df[which(misc.df$Date!=""),]
+
+colnames(misc.df) <- c("date", "time", "round", "day", "venue", "result", 
+                       "goalsF", "goalsA", "opp", "yellowCrd", "redCrd", 
+                       "yellow2Crd", "foulsCom", "fouldDrwn", "offsides",
+                       "crosses", "interceptions", "tklW", "pkW", "pkCon", 
+                       "ownGoal", "looseBallsRec", "arielsW", "arielsL",
+                       "pctAriels", "matchreport", "team")
+
+misc.df$id <- paste(misc.df$date,misc.df$team,sep = "_")
+
+rownames(misc.df) <- NULL
+
+#passing data
+passing <- lapply(passing, function(x) {
+  cbind(x, Team = ifelse(x[,30]=="Prog", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+passing <- lapply(passing, function(x) tail("names<-"(x, x[1, ]), -1))
+
+passing.todel <- seq(0, nrow(passing[[1]]), 2)
+passing <- lapply(passing, function(x) {x <- x[-passing.todel, ]})
+
+passing.df <- do.call(rbind, passing)
+passing.df <- passing.df[which(passing.df$Date!=""),]
+
+colnames(passing.df) <- c("date", "time", "round", "day", "venue", "result",
+                          "goalsF", "goalsA", "opp", "passComp", "passAtt", 
+                          "pctPass", "passDis", "passPrgDis", "passShortCom", 
+                          "passShortAtt", "pctPassShort", "passMedCom", 
+                          "passMedAtt", "pctPassMed", "passLongCom", 
+                          "passLongAtt", "pctPassLong", "assists",
+                          "xGoalAss", "keyPass", "passAtt3", "passPenArea",
+                          "crossPenArea", "progPass", "matchreport", "team")
+
+passing.df$id <- paste(passing.df$date,passing.df$team,sep = "_")
+
+rownames(passing.df) <- NULL
+
+#passing type data
+passing_types <- lapply(passing_types, function(x) {
+  cbind(x, Team = ifelse(x[,34]=="Blocks", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+passing_types <-
+  lapply(passing_types, function(x) tail("names<-"(x, x[1, ]), -1))
+
+passing_types.todel <- seq(0, nrow(passing_types[[1]]), 2)
+passing_types <-
+  lapply(passing_types, function(x) {x <- x[-passing_types.todel, ]})
+
+passing_types.df <- do.call(rbind, passing_types)
+passing_types.df <- passing_types.df[which(passing_types.df$Date!=""),]
+
+colnames(passing_types.df) <- c("date", "time", "round", "day", "venue", 
+                                "result", "goalsF", "goalsA", "opp", "passAtt", 
+                                "passLive", "passDead", "passFreeKick",
+                                "passThrough", "passPressure", "passSwitch", 
+                                "crosses", "corners", "cornerInSwing",
+                                "cornerOutSwing", "cornerStraight", "passGround",
+                                "passLow", "passHigh", "passLeftFoot",
+                                "passRightFoot", "passHead", "throwin",
+                                "passOtherBody", "passComp",  "passOffside", 
+                                "passOut", "passIntercepted", "passBlock",
+                                "matchreport", "team")
+
+passing_types.df$id <-
+  paste(passing_types.df$date,passing_types.df$team,sep = "_")
+
+rownames(passing_types.df) <- NULL
+
+#possession data
+possession <- lapply(possession, function(x) {
+  cbind(x, Team = ifelse(x[,29]=="Dispos", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+possession <- lapply(possession, function(x) tail("names<-"(x, x[1, ]), -1))
+
+possession.todel <- seq(0, nrow(possession[[1]]), 2)
+possession <- lapply(possession, function(x) {x <- x[-possession.todel, ]})
+
+possession.df <- do.call(rbind, possession)
+possession.df <- possession.df[which(possession.df$Date!=""),]
+
+colnames(possession.df) <- c("date", "time", "round", "day", "venue", "result",
+                             "goalsF", "goalsA", "opp", "touches", 
+                             "touchesDefPen", "touchesDef3rd", "touchesMid3rd", 
+                             "touchesAtt3rd", "touchesAttPen", "touchesLive", 
+                             "drblsSucc", "drblsAtt", "drblsPct", "drblsPast", 
+                             "nutmegs", "controlFoot", "controlDis", 
+                             "controlProgDis", "passTgt", "passRecSucc", 
+                             "passPctRec", "miscontrol", "dispossessed",
+                             "matchreport", "team")
+
+possession.df$id <- paste(possession.df$date,possession.df$team,sep = "_")
+
+rownames(possession.df) <- NULL
+
+#shooting data
+shooting <- lapply(shooting, function(x){
+  cbind(x, Team = ifelse(x[,24]=="np:G-xG", "Team",
+                         gsub(".* ()","",colnames(x[1])))
+        )
+  })
+
+shooting <- lapply(shooting, function(x) tail("names<-"(x, x[1, ]), -1))
+
+shooting.todel <- seq(0, nrow(shooting[[1]]), 2)
+shooting <- lapply(shooting, function(x) {x <- x[-shooting.todel, ]})
+
+shooting.df <- do.call(rbind, shooting)
+shooting.df <- shooting.df[which(shooting.df$Date!=""),]
+
+colnames(shooting.df) <- c("date", "time", "round", "day", "venue", "result",
+                           "goalsF", "goalsA", "opp", "goals", "shots",
+                           "shotsOnTgt", "shotsPctOnTgt", "goalsPerSh",
+                           "goalsPerShOnTgt", "shotDisGoal", "shotFreeKick",
+                           "penalty", "penAtt", "expGoal", "noPenExpGoal", 
+                           "npG/sh", "goalsMinExp", "np:G-xG", "matchreport", 
+                           "team")
+
+shooting.df$id <- paste(shooting.df$date,shooting.df$team,sep = "_")
+
+rownames(shooting.df) <- NULL
+
+rm(defense, def.todel, gca, gca.todel, misc, misc.todel, passing, passing.todel,
+   passing_types, passing_types.todel, possession, possession.todel, shooting,
+   shooting.todel)
+```
+
+### Creating the full data frame
+The final step was to combine all the data from fbref into one giant data frame.
+```{r}
+#initiate fbref final by joining defense with goal and shot creation data
+fbref.df <- left_join(defense.df[,c(1:29,31:32,34:35)],
+                      gca.df[,c(10:24,27)],by="id")
+
+#left join miscellaneous
+fbref.df <- left_join(fbref.df,misc.df[,c(10:16,19:25,28)],by="id")
+
+#join on passing data
+fbref.df <- left_join(fbref.df,passing.df[,c(10:24,26:30,33)],by="id")
+
+#join on passing type data
+fbref.df <- left_join(fbref.df,
+                      passing_types.df[,c(11:16,18:29,31:34,37)],by="id")
+
+#join on possession data
+fbref.df <- left_join(fbref.df,possession.df[,c(10:29,32)],by="id")
+
+#join on shooting data
+fbref.df <- left_join(fbref.df,shooting.df[,c(11:17,23,27)],by="id")
+```
+
+I converted all the columns that should be numeric to numeric and created a season column to indicate the season the game was played in. I also had to remove 2 data points for a game that was not played because of COVID.^[[Match week 3: Juventus-Napoli](https://www.espn.com/soccer/napoli/story/4200534/juventus-vs-napoli-off-as-visitors-fail-to-show-for-game-due-to-coronavirus-quarantine)]
+```{r}
+i <- c(7,8,10:31,34:132)
+fbref.df[,i] <- lapply(fbref.df[,i], function(x) as.numeric(as.character(x)))
+rm(i)
+
+#convert to date format
+fbref.df$date <- as.Date.character(fbref.df$date, c('%Y-%m-%d'))
+
+#remove new weekend data
+fbref.df <- subset(fbref.df,fbref.df$date<"2020-12-05")
+
+#create season label
+fbref.df$season <-
+  ifelse(fbref.df$date < "2018-05-20", "S1718",
+         ifelse(fbref.df$date >= "2018-08-18" & fbref.df$date <= "2019-05-26",
+                "S1819",
+                ifelse(fbref.df$date >= "2019-08-24" &
+                         fbref.df$date <= "2020-08-02",
+                       "S1920","S2021")))
+
+#remove game that was not played 
+fbref.df <- subset(fbref.df,!(is.na(fbref.df$touches)))
+
+#replace other na vars with 0
+fbref.df[is.na(fbref.df)] <- 0
+```
+
+I created the master dataframe, merging the fbref data frame with the spi data frame, converted the date to date, and renamed some more teams to keep everything standardized.
+```{r}
+#add spi data to fbref data
+full.df <- left_join(fbref.df,spi.df[,c(5,9,15)],by="id")
+
+#convert the date to date formt
+full.df$date <- as.Date.character(full.df$date,c("%Y-%m-%d"))
+
+#clean up last team names
+full.df$opp <- ifelse(full.df$opp=="Inter","Internazionale",full.df$opp)
+full.df$opp <- ifelse(full.df$opp=="Hellas Verona","Verona",full.df$opp)
+```
+
+# Initial Analysis
+After the arduous process of collecting the data, it was time to start analyzing what we had. Considering that goals could be few and scarce, I decided to standardize the data by grabbing the average of each data point by team and season. This made it easier to run analysis since the data points became more normalized. 
+
+## Understanding the data
+The first step was to summarize all the numeric variables by team and season. This way we standardized the data.
+```{r}
+#create average data frame
+full.avg.df <- full.df %>%
+  group_by(team,season) %>%
+  summarise_if(is.numeric, mean, na.rm = T)
+
+full.avg.df <- full.avg.df %>%
+  mutate(passAtt3pct = passAtt3/passComp)
+```
+
+Finally since I knew I wanted to run a regression model on goalsF, I decided to run a correlation matrix for all the data points. I selected data points that had a correlation of greater than 0.5 or less than -0.4. Additionally I then removed variables that didn't make sense logically or were going to be correlated with themselves, for example total touches and touches in the attacking 3rd.
+
+The final variables I was going to start with are the ones in this correlation matrix.
+```{r, echo=F, fig.show='hold', fig.height=20, fig.width=20}
+ggcorr(full.avg.df[,c("goalsF","pctPressure", "shAction", "passComp", 
+                      "keyPass", "passAtt3", "passPenArea", "progPass",
+                      "passLive", "passDead", "corners", "passGround",
+                      "touches", "touchesMid3rd", "touchesAtt3rd", 
+                      "touchesAttPen", "touchesLive", "controlFoot",
+                      "controlDis", "controlProgDis","passPctRec",
+                      "shotsOnTgt", "shotDisGoal", "clears", "goalsMinExp")],
+       method = c("everything", "pearson"),
+       label = T) +
+  ggtitle("Correlation matrix for data of interest") +
+  theme_bw()
+```
+
+## Regression analysis
+### Models
+The first regression model uses all the variables listed in the correlation matrix in the previous section. The results are not very promising as most of the variables are insignificant. One thing that I realized quickly was that there is probably a lot of collinearity within the variables. For example, *Completed pass* and all the other pass variables will be correlated as completed passes accounts for all of the sub sections. Additionally, some of the variables that might be correlated with goals in the data, don't make sense when actually playing. I don't think the number of clears you have affects goals as much as say shooting actions.
+```{r, echo=F}
+m.goals <- lm(goalsF ~ pctPressure +
+                shAction +
+                passComp +
+                keyPass +
+                passAtt3 +
+                passPenArea +
+                progPass +
+                passLive +
+                passDead +
+                corners +
+                passGround +
+                touches +
+                touchesMid3rd +
+                touchesAtt3rd +
+                touchesAttPen +
+                touchesLive +
+                controlFoot +
+                controlDis +
+                controlProgDis +
+                passPctRec +
+                shotsOnTgt +
+                shotDisGoal +
+                clears,
+             data = full.avg.df)
+```
+<div align="center">
+```{r, echo=F, results='asis', message=F, warning=F, comment=NA}
+stargazer(m.goals, type = "html", title = "Initial model",
+          covariate.labels = c("Percent successful pressure",
+                               "Shot creating action", "Completed pass",
+                               "Number of passes that lead to shot",
+                               "Passes in the attacking 3rd",
+                               "Passes in the penalty area",
+                               "Progressive passes", "Live-ball passes",
+                               "Dead-ball passes", "Corners", "Ground passes",
+                               "High passes", "Number of touches",
+                               "Number of touches in defensive penalty area",
+                               "Touches in the middle 3rd",
+                               "Touches in the attacking 3rd",
+                               "Touches in the attacking penalty",
+                               "Live-ball touches", "Number of carries",
+                               "Total distnance of carries",
+                               "Total progressive distance of touches",
+                               "Percent passes recieved successfully",
+                               "Shots on target", "Shot distance from goal",
+                               "Cleared balls"),
+          dep.var.caption = "Goals", dep.var.labels.include = F,
+          omit.stat = c("f","ser"), single.row=T, no.space = T, header=F,
+          digits = 3, model.numbers = F, table.placement = "H")
+```
+</div>
+After simplifying the model by removing detailed information about touches and passes, and just using the overall summary variables, I used backward selection to remove other variables like number of cleared balls and number corner kicks. The final model improved my Adj-$R^{2}$ from 79.6% to 81.3% while reducing my variables from 23 to just 8. Continuing my analysis I wanted to check the residuals and make sure they were normal.
+```{r, echo=F}
+m.goals.final <- lm(goalsF ~ pctPressure +
+                      passComp +
+                      passAtt3 +
+                      passDead +
+                      touches +
+                      touchesLive +
+                      shotsOnTgt +
+                      shotDisGoal,
+                    data = full.avg.df)
+```
+<div align="center">
+```{r, echo=F, results='asis', message=F, warning=F, comment=NA}
+stargazer(m.goals.final, type = "html", title = "Final model",
+          covariate.labels = c("Percent successful pressure","Completed pass",
+                               "Passes in attacking 3rd", "Dead ball passes",
+                               "Number of touches",
+                               "Number of live ball touches", "Shots on target",
+                               "Shot distance from goal"),
+          dep.var.caption = "Goals", dep.var.labels.include = F,
+          omit.stat = c("f","ser"), single.row=T, no.space = T, header=F,
+          digits = 3, model.numbers = F, table.placement = "H")
+```
+</div>
+
+### Residuals
+I wanted to make sure that the residual plots for both my initial model and my final model were normal and compare the two. Looking at the residual plots and the histograms we don't see much difference between my initial and final models. With the addition of the QQ plot, however, we see that the final model residuals look more normally distributed. This added to my confidence for the model and helped me decide which variables to include in my outcome predictive model.
+```{r, echo = F,fig.show='hold',out.width="50%"}
+#initial model residual plot
+ggplot(m.goals,aes(.fitted,.resid))+
+  geom_jitter()+
+  geom_smooth(method = glm, se = F)+
+  ggtitle("Residual plot of initial model") +
+  xlab("Fitted values") +
+  ylab("Residual values") +
+  theme_bw()
+
+#initial model histogram
+ggplot(m.goals,aes(.resid)) +
+  geom_histogram(bins = 15, fill="chocolate", colour="black", size=0.1) +
+  scale_y_continuous(expand = expansion(mult = c(0, .05))) +
+  ggtitle("Histogram of initial model residuals") +
+  xlab("Residuals") +
+  ylab("Frequency") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+#initial model residual qq-plot
+ggplot(m.goals,aes(sample = .resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  ggtitle("QQ-Plot for initial model residuals") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+#initial model residual plot
+ggplot(m.goals.final,aes(.fitted,.resid))+
+  geom_jitter()+
+  geom_smooth(method = glm, se = F)+
+  ggtitle("Residual plot of final model") +
+  xlab("Fitted values") +
+  ylab("Residual values") +
+  theme_bw()
+
+#final model residual histogram
+ggplot(m.goals.final,aes(.resid)) +
+  geom_histogram(bins = 15, fill="chocolate", colour="black", size=0.1) +
+  scale_y_continuous(expand = expansion(mult = c(0, .05))) +
+  ggtitle("Histogram of final model residuals") +
+  xlab("Residuals") +
+  ylab("Frequency") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+#final model residual qq-plot
+ggplot(m.goals.final,aes(sample = .resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  ggtitle("QQ-Plot for final model residuals") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+# Predictive Model
+
+My final goal with this analysis is an attempt to create a predictive model for the outcomes of future games. My idea for this model was to use data for both the home team and away team to make the model more predictive. I had to restructure the data so that the season averages for both the home teams and the away teams could be in the same data frame, I needed to create a training and testing data frames, I created a multinomial logistic regression because in soccer you can have Wins, Losses, and Ties, and finally I tested the model on Matchday 10 Serie A games.
+
+## Data set up
+The first part is to develop a data frame that includes both home team and away team stats. To do this I start with the full data frame created at the beginning of this project and select only the column that are of interest.
+```{r}
+#create the base data frame
+opp.df <-
+  left_join(full.df[,c("team", "season", "date", "result", "opp")],
+            full.df[,c("team", "season", "date", "pctPressure", "passComp",
+                       "passAtt3", "passDead", "touches", "touchesLive",
+                       "shotsOnTgt", "shotDisGoal", "glAction", "shAction",
+                       "goalsPerSh", "spi")],
+            by=c("team","season","date"))
+
+#rename the columns using the prefix home
+for(col in c(1,6:17)){
+  colnames(opp.df)[col] <- paste0("home_",colnames(opp.df)[col])
+}
+```
+```{r,echo=F}
+rm(col)
+```
+The crucial step is to rename the opponent as the new team column. This allows us to rejoin the same full data frame, but this time add the away team's statistics.
+```{r}
+#rename the opp column to team
+opp.df <- rename(opp.df,c("team" = "opp"))
+
+#rejoin full df to get the away team statistics.
+opp.df <- 
+  left_join(opp.df,
+            full.df[,c("team", "season", "date", "pctPressure", "passComp",
+                       "passAtt3", "passDead", "touches", "touchesLive",
+                       "shotsOnTgt", "shotDisGoal", "glAction", "shAction",
+                       "goalsPerSh", "spi")],
+            by=c("team", "season", "date"))
+
+#rename variables to use prefix away
+for(col in c(5,18:29)){
+  colnames(opp.df)[col] <- paste0("away_",colnames(opp.df)[col])
+}
+```
+```{r, echo=F}
+rm(col)
+```
+Finally, I randomize the data and create a training data set, which is comprised of 85% of the full data frame rows. The test data set will be the remaining 15%.
+```{r}
+#randomize the data frame
+rows <- sample(nrow(opp.df))
+```
+```{r}
+random.opp.df <- opp.df[rows,]
+rownames(random.opp.df) <- NULL
+
+#create training data
+train.df <- random.opp.df[1:floor(nrow(random.opp.df)*0.85),]
+test.df <- random.opp.df[ceiling(nrow(random.opp.df)*0.85):nrow(random.opp.df),]
+```
+Now I'm ready to develop the model.
+
+## Model
+For the model I didn't want to standardize the data, I wanted to use the actual game data to predict the outcome. To account for home team and away team data I developed the model to use an interaction term subtracting the home teams values to the away teams values. For example if the home team had 4 goal actions and the away team only had 1 the difference would be +3. This stat would inform the model. The idea was to score each teams performance compared to their opponents. If the statistics were mostly positive then the home team should come out as winner, if they were negative then the away team would be the winner, and if they were closer to 0 then the outcome should be a tie.
+
+```{r, message=F, comment=F,results='hide'}
+m.predict <- multinom(result ~
+                        I(home_glAction-away_glAction) +
+                        I(home_shAction-away_shAction) +
+                        I(home_pctPressure-away_pctPressure) +
+                        I(home_passComp-away_passComp)+
+                        I(home_touches-away_touches) +
+                        I(home_shotsOnTgt-away_shotsOnTgt)+
+                        I(home_shotDisGoal-away_shotDisGoal) +
+                        I(home_goalsPerSh-away_goalsPerSh) +
+                        I(home_spi-away_spi),
+                      data = train.df, na.action = na.omit)
+```
+
+Then, using the test data, I checked how well my model was able to predict results. It seems like over  all my model was accurate around 86.2% of the time, not bad.
+```{r, echo=F}
+pred.df <- cbind(test.df,predict(m.predict,test.df))
+pred.df <- rename(pred.df,c("predicted_outcome"="predict(m.predict, test.df)"))
+pred.df$predicted_outcome <- as.character(pred.df$predicted_outcome)
+pred.df$succPred <-
+  ifelse(pred.df$result == pred.df$predicted_outcome,"success","fail")
+```
+
+```{r, echo=F}
+kable(pred.df %>% 
+        count(succPred) %>%
+        mutate(pct = paste0(as.character(round((n/sum(n))*100,2)),"%")),
+      caption = "Percent correctly predicted results",
+      col.names = c("Prediction result","Totals","Percent"),
+      format = "html",
+      booktabs = T) %>%
+  kable_minimal(full_width = F)
+```
+
+Looking more in depth we see that wins were the easiest to predict with the model predicting 89.7% of wins correctly. Losses were the second easiest to predict with 88.7% accuracy, while ties were the hardest to predict with 77.8% accuracy.
+```{r, echo=F}
+kable(table(pred.df$result,pred.df$predicted_outcome),
+      caption = "Number successful and wrong predictions for each result",
+      # row.names = c("Observed: ties", "Observed: losses", "Observed: wins"),
+      col.names = c("Predicted: ties", "Predicted: losses", "Predicted: wins"),
+      format = "html",
+      booktabs = T) %>%
+  kable_minimal(full_width=F)
+```
+
+# Conclusion
+I'm happy with both my linear regression model and logistic regression models. Of course the real test is to see how it holds up against a games where there is no data. For that reason I decided to predict match day 10 of Serie A. I needed to average this seasons data for each since the match day 10 games have not been played anymore. As of writing this report I managed to predict only 1 game correctly of 3 games played so far.
+```{r, echo=F}
+#create week schedule
+next.week <- data.frame("season" = "S2021",
+                        "home_team"=c("Crotone", "Fiorentina", "Internazionale",
+                                      "Juventus", "Parma", "Roma", "Sampdoria",
+                                      "Spezia", "Udinese", "Verona"),
+                        "away_team"=c("Napoli", "Genoa", "Bologna",
+                                      "Torino", "Benevento", "Sassuolo", "Milan",
+                                      "Lazio", "Atalanta", "Cagliari"),
+                        "home_observed"=c(NA,NA,"W","W",NA,NA,NA,"L",NA,NA),
+                        "away_observed"=c(NA,NA,"L","L",NA,NA,NA,"W",NA,NA))
+
+#average the home team's data
+home.df <- opp.df %>%
+  group_by(home_team,season) %>%
+  summarise_if(is.numeric, mean, na.rm = T)
+
+#average the away team's data
+away.df <- opp.df %>%
+  group_by(away_team,season) %>%
+  summarise_if(is.numeric, mean, na.rm = T)
+
+#join home team data to next week data frame
+next.week <- 
+  left_join(next.week,unique(home.df[,c("home_team", "season", 
+                                        "home_pctPressure", "home_passComp",
+                                        "home_passAtt3", "home_passDead",
+                                        "home_touches", "home_touchesLive",
+                                        "home_shotsOnTgt", "home_shotDisGoal",
+                                        "home_glAction", "home_shAction",
+                                        "home_goalsPerSh", "home_spi")]),
+            by = c("home_team","season"))
+
+#join away team data to next week data frame
+next.week <- 
+  left_join(next.week,unique(away.df[,c("away_team", "season", 
+                                        "away_pctPressure", "away_passComp",
+                                        "away_passAtt3", "away_passDead",
+                                        "away_touches", "away_touchesLive",
+                                        "away_shotsOnTgt", "away_shotDisGoal",
+                                        "away_glAction", "away_shAction",
+                                        "away_goalsPerSh", "away_spi")]),
+            by = c("away_team","season"))
+
+#use the model to predict results
+next.week <- cbind(next.week,predict(m.predict,next.week))
+
+#rename the predicted results column
+next.week <- rename(next.week,c("home_result"="predict(m.predict, next.week)"))
+
+#create a result for both home and away teams
+next.week$away_result <- ifelse(next.week$home_result == "W","L",
+                                ifelse(next.week$home_result == "L","W","D"))
+
+rm(home.df,away.df)
+```
+```{r,echo=F,results='asis'}
+kable(next.week[,c("home_observed", "home_team", "home_result",
+                   "away_result", "away_team","away_observed")],
+      format = "html", booktabs = T,
+      caption = "Match day 10: Predicted vs Observed results",
+      col.names = c("Observed home outcome", "Home team",
+                    "Projected home outcome", "Observed away results",
+                    "Away team", "Projected away results")) %>%
+  kable_minimal()
+```
+I should have been correct in predicting the Juventus - Torino game, only to get snubbed after a 90th min goal. And that is the sort of error that I am not sure I can correct with additional data. One of the limitations in soccer predictions is that you have three options and you are not just predicting winners and losers, but also the chance of a tie.
+
+One thing I would like to attempt in the future is figuring out a way to include
+more historical data or some other variable. One option is to add more defensive variables to credit teams that have a stronger defense and potentially a less strong offense. Another idea is to create a metric that rates the teams performance for that game compared to how they should have preformed for that game. This approach, however, would require more in game data points to compare how a team performed vs how a teams data suggests they should have performed.
+
+If my model can sustain this 86% correct prediction rate than I think it will only grow stronger with more data in the future, if it cannot sustain that prediction success rate, then it will require going back to the drawing board to rethink the model and the data needed.
