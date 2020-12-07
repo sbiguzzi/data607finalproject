@@ -45,7 +45,7 @@ My next step was to understand what variables to use in my predictive model. I k
 
 To create the list of variables I looked through a huge correlation matrix of all 127 variables and decided to use variables that were correlated to goals for either at +0.5 and above or -0.4 and below level. Next I created a logistic regression using all the variables I thought were correlated enough and applied the backward selection process to finalize a model that had a high Adj-$R^{2}$ and was significant.
 
-The last step is to develop a multinomial logistic regression to predict winners for match day 10, starting on Dec 5th and the last game being played on Dec 11th.
+The last step is to develop a multinomial logistic regression to predict winners for match day 10.
 
 # Loading data
 
@@ -869,8 +869,8 @@ next.week <- data.frame("season" = "S2021",
                         "away_team"=c("Napoli", "Genoa", "Bologna",
                                       "Torino", "Benevento", "Sassuolo", "Milan",
                                       "Lazio", "Atalanta", "Cagliari"),
-                        "home_observed"=c(NA,NA,"W","W",NA,NA,NA,"L",NA,NA),
-                        "away_observed"=c(NA,NA,"L","L",NA,NA,NA,"W",NA,NA))
+                        "home_observed"=c("L",NA,"W","W","D","D","L","L",NA,"D"),
+                        "away_observed"=c("W",NA,"L","L","D","D","W","W",NA,"D"))
 
 #average the home team's data
 home.df <- opp.df %>%
