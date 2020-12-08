@@ -869,8 +869,10 @@ next.week <- data.frame("season" = "S2021",
                         "away_team"=c("Napoli", "Genoa", "Bologna",
                                       "Torino", "Benevento", "Sassuolo", "Milan",
                                       "Lazio", "Atalanta", "Cagliari"),
-                        "home_observed"=c("L",NA,"W","W","D","D","L","L",NA,"D"),
-                        "away_observed"=c("W",NA,"L","L","D","D","W","W",NA,"D"))
+                        "home_observed"=c("L", "D", "W", "W", "D", "D", "L", "L",
+                                          NA, "D"),
+                        "away_observed"=c("W", "D", "L", "L", "D", "D", "W", "W",
+                                          NA, "D"))
 
 #average the home team's data
 home.df <- opp.df %>%
